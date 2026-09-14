@@ -115,12 +115,25 @@ jobs:
           gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
             --remove-label "$LABEL_IN_PROGRESS"
 
-      - name: Mark needs-human (no changes or failed)
-        if: steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code != '0'
+      - name: Mark needs-human (no changes / failed / unexpected error)
+        # always()：之前這裡沒有這個，2026-09 實測過一次——「Install target
+        # repo dev dependencies」那步本身失敗（不是 agent 修改/測試失敗），
+        # 導致 job 狀態變成 failure，這步跟 Open PR 那步的預設條件都隱含要求
+        # 前面 success()，兩個都被跳過，issue 就卡在 swe-agent-in-progress
+        # 再也沒人處理。加 always() 讓這步不管前面是不是失敗都會跑，確保
+        # 每次「有撿到 issue」的 run 最後一定會有個交代，不會卡死。
+        if: always() && steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code != '0'
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
         run: |
-          gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
-            --body-file agent_summary.md
+          if [ -f agent_summary.md ]; then
+            gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+              --body-file agent_summary.md
+          else
+            # agent_summary.md 不存在代表根本沒跑到「Run SWE Agent」那步，
+            # 是更早的步驟本身出錯（例如裝依賴失敗），附上這次 run 的 log 連結。
+            gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+              --body "SWE Agent 這次執行中途發生非預期錯誤（pipeline 本身某個步驟失敗，不是 agent 修改/測試的問題），詳見 log：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          fi
           gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
             --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_HUMAN"
