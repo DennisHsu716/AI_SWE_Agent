@@ -1,0 +1,124 @@
+name: SWE Agent
+
+on:
+  schedule:
+    # 每 30 分鐘檢查一次 target repo 有沒有新的待處理 issue。
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: swe-agent
+  cancel-in-progress: false
+
+env:
+  TARGET_REPO: DennisHsu716/job-scraper
+  LABEL_TODO: auto-fix
+  LABEL_IN_PROGRESS: swe-agent-in-progress
+  LABEL_NEEDS_HUMAN: swe-agent-needs-human
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node (for claude CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Find oldest unprocessed issue
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          issue=$(gh issue list --repo "$TARGET_REPO" \
+            --label "$LABEL_TODO" \
+            --state open \
+            --json number,title,body,createdAt \
+            --jq 'sort_by(.createdAt) | .[0]')
+          if [ -z "$issue" ] || [ "$issue" = "null" ]; then
+            echo "has_issue=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_issue=true" >> "$GITHUB_OUTPUT"
+          echo "number=$(echo "$issue" | jq -r .number)" >> "$GITHUB_OUTPUT"
+          echo "title=$(echo "$issue" | jq -r .title)" >> "$GITHUB_OUTPUT"
+          echo "$issue" | jq -r .body > issue_body.md
+
+      - name: Mark issue in-progress
+        if: steps.pick.outputs.has_issue == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+            --add-label "$LABEL_IN_PROGRESS" --remove-label "$LABEL_TODO"
+
+      - name: Checkout target repo
+        if: steps.pick.outputs.has_issue == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" target
+          cd target
+          git checkout -b "swe-agent/issue-${{ steps.pick.outputs.number }}"
+          git config user.name "swe-agent-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Install target repo dev dependencies
+        if: steps.pick.outputs.has_issue == 'true'
+        run: pip install -r target/requirements-dev.txt
+
+      - name: Run SWE Agent
+        id: agent
+        if: steps.pick.outputs.has_issue == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          python3 scripts/run_agent.py \
+            --issue-number "${{ steps.pick.outputs.number }}" \
+            --issue-title "${{ steps.pick.outputs.title }}" \
+            --issue-body-file issue_body.md \
+            --repo-dir target
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: Open PR (success)
+        if: steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code == '0'
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          cd target
+          git add -A
+          git commit -m "fix: resolve #${{ steps.pick.outputs.number }} (${{ steps.pick.outputs.title }})
+
+          Co-Authored-By: swe-agent-bot <actions@users.noreply.github.com>"
+          git push origin "swe-agent/issue-${{ steps.pick.outputs.number }}"
+          gh pr create --repo "$TARGET_REPO" \
+            --title "fix: ${{ steps.pick.outputs.title }} (closes #${{ steps.pick.outputs.number }})" \
+            --body-file ../agent_summary.md \
+            --head "swe-agent/issue-${{ steps.pick.outputs.number }}" \
+            --base main
+          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+            --remove-label "$LABEL_IN_PROGRESS"
+
+      - name: Mark needs-human (no changes or failed)
+        if: steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code != '0'
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+        run: |
+          gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+            --body-file agent_summary.md
+          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+            --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_HUMAN"
