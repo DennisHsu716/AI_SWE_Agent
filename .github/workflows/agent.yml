@@ -15,9 +15,9 @@ env:
   LABEL_TODO: auto-fix
   LABEL_IN_PROGRESS: swe-agent-in-progress
   LABEL_NEEDS_HUMAN: swe-agent-needs-human
-  # 想換模型（例如免費額度撐不住、想換成付費層級的其他 Gemini 版本）
+  # 想換模型（例如這個模型撞到能力不夠、或 Groq 把它下架了）
   # 改這裡就好，不用動 scripts/run_agent.py。
-  AIDER_MODEL: gemini/gemini-2.5-pro
+  AIDER_MODEL: groq/openai/gpt-oss-120b
 
 jobs:
   agent:
@@ -85,7 +85,7 @@ jobs:
         id: agent
         if: steps.pick.outputs.has_issue == 'true'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           set +e
           python3 scripts/run_agent.py \

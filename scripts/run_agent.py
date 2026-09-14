@@ -28,11 +28,14 @@ import sys
 from pathlib import Path
 
 # 可以用環境變數覆寫，不用改程式碼——job-scraper 自己的 config.py 也是
-# 這種「模型字串集中一個地方、方便換」的做法。Gemini 免費版額度很緊
-# （job-scraper 的 config.py 註解寫生成模型大概每天只有 20~40 次），Aider
-# 一次 coding session 打的 API 次數遠高於 job-scraper 原本「一個職缺一次」
-# 的用量，額度可能撐不住，必要時去 Google AI Studio 開付費層級。
-DEFAULT_AIDER_MODEL = "gemini/gemini-2.5-pro"
+# 這種「模型字串集中一個地方、方便換」的做法。改用 Groq 是因為免費層級的
+# rate limit 比 Gemini 大方很多，代價是模型能力比 Gemini/Claude 這種頂級
+# 模型弱一截（開源模型），複雜一點的 bug 更容易卡住、轉成 needs-human——
+# 這是預期中的 tradeoff，不是 bug。openai/gpt-oss-120b 是 2026-09 查
+# console.groq.com/docs/models 當下的旗艦模型，Groq 的模型清單常變動，
+# 正式用之前建議先跑 `aider --list-models groq/` 確認這個字串還有效、
+# 有沒有更新的選擇。
+DEFAULT_AIDER_MODEL = "groq/openai/gpt-oss-120b"
 
 # 沒有花費上限機制，牆鐘時間上限是唯一的安全閥，撞到就視為這一輪失敗，
 # 轉 needs-human，不無限期燒下去。
