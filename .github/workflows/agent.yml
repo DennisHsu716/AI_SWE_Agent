@@ -15,6 +15,9 @@ env:
   LABEL_TODO: auto-fix
   LABEL_IN_PROGRESS: swe-agent-in-progress
   LABEL_NEEDS_HUMAN: swe-agent-needs-human
+  # 想換模型（例如免費額度撐不住、想換成付費層級的其他 Gemini 版本）
+  # 改這裡就好，不用動 scripts/run_agent.py。
+  AIDER_MODEL: gemini/gemini-2.5-pro
 
 jobs:
   agent:
@@ -27,15 +30,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          # 3.12，不是跟 job-scraper 一樣的 3.13——本機測試時 3.13 上
+          # aider-chat 的某個依賴（numpy 舊版 sdist）build 失敗，3.12 上
+          # 有現成 wheel 可用，風險比較低。job-scraper 自己的 requirements-dev.txt
+          # 另外用 pip install 裝，不受這裡的版本影響。
+          python-version: "3.12"
 
-      - name: Set up Node (for claude CLI)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install claude CLI
-        run: npm install -g @anthropic-ai/claude-code
+      - name: Install aider-chat
+        run: pip install aider-chat
 
       - name: Find oldest unprocessed issue
         id: pick
@@ -83,7 +85,7 @@ jobs:
         id: agent
         if: steps.pick.outputs.has_issue == 'true'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set +e
           python3 scripts/run_agent.py \

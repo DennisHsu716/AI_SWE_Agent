@@ -4,8 +4,15 @@ run_agent.py — SWE Agent Core Loop，對著已經 checkout 好的 target repo 
 
 呼叫端（agent.yml）負責：挑 issue、checkout target repo、跑完之後根據這支
 腳本的 exit code 決定要開 PR 還是標記 needs-human。這支腳本只做兩件事：
-呼叫 claude 修東西、用 pytest 當作唯一可信的把關標準（不採信 agent 自己說
-「改完了」，一定重新跑一次測試才算數）。
+呼叫 Aider（接 Gemini）修東西、用 pytest 當作唯一可信的把關標準（不採信
+agent 自己說「改完了」，一定重新跑一次測試才算數）。
+
+用 Aider 而不是 claude CLI：Aider 本身不執行任意 shell 指令（沒有 Bash
+tool 這種東西），只做「讀檔案→提出修改→寫回去」，可以指定 --test-cmd 讓
+它自己邊改邊跑測試。代價是沒有花費上限（--max-budget-usd 那種機制不存
+在），牆鐘 timeout 變成唯一的安全閥；而且它自己重試幾次沒有文件記載，所以
+最後這支腳本還是要獨立重跑一次 pytest 才算數，不能只看 Aider 自己回報的
+結果。
 
 Exit code：
   0 = 測試通過，而且有實際改動 → 呼叫端開 PR
@@ -15,22 +22,20 @@ Exit code：
 """
 
 import argparse
-import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-# 只給這幾個工具，不用 --dangerously-skip-permissions——那個官方建議只給
-# 沒有網路的 sandbox，這個 runner 要連 GitHub/PyPI，不適合整個放行。
-# Bash 限定在跑測試/裝依賴/git 操作，不給任意指令。
-ALLOWED_TOOLS = [
-    "Read", "Edit", "Write", "Grep", "Glob",
-    "Bash(pytest*)", "Bash(python3*)", "Bash(pip*)", "Bash(git*)",
-]
+# 可以用環境變數覆寫，不用改程式碼——job-scraper 自己的 config.py 也是
+# 這種「模型字串集中一個地方、方便換」的做法。Gemini 免費版額度很緊
+# （job-scraper 的 config.py 註解寫生成模型大概每天只有 20~40 次），Aider
+# 一次 coding session 打的 API 次數遠高於 job-scraper 原本「一個職缺一次」
+# 的用量，額度可能撐不住，必要時去 Google AI Studio 開付費層級。
+DEFAULT_AIDER_MODEL = "gemini/gemini-2.5-pro"
 
-# 單次 run 的安全閥：花費上限（美金）+ 牆鐘時間上限（秒）。撞到任何一個
-# 就視為這一輪失敗，轉 needs-human，不無限期燒下去。
-MAX_BUDGET_USD = 2.0
+# 沒有花費上限機制，牆鐘時間上限是唯一的安全閥，撞到就視為這一輪失敗，
+# 轉 needs-human，不無限期燒下去。
 WALL_CLOCK_TIMEOUT_SECONDS = 1800
 
 # 這些路徑碰到就一律轉 needs-human，就算測試過了也一樣——CI 設定、密鑰處理、
@@ -65,42 +70,42 @@ def build_prompt(issue_number: int, issue_title: str, issue_body: str) -> str:
 完成後用一段簡短的中文摘要說明你做了什麼改動、為什麼，還有測試結果。"""
 
 
-def run_claude(prompt: str, cwd: Path) -> tuple[bool, str]:
-    """回傳 (是否正常結束, claude 的文字輸出)。"""
+def run_aider(prompt: str, cwd: Path) -> str:
+    """呼叫 Aider 修改 cwd 底下的檔案，回傳它的文字輸出（不代表成功與否，
+    成功與否交給呼叫端用 git diff + pytest 獨立驗證）。"""
+    model = os.environ.get("AIDER_MODEL", DEFAULT_AIDER_MODEL)
+
+    # 一次性 --message 模式下，Aider 能不能自己發現該改哪個檔案沒有明確
+    # 文件保證，保險起見明確把 repo 裡的 .py 檔案都列給它，不要賭它會自動
+    # 找到——job-scraper 檔案不多，全列出來成本很低。
+    py_files = sorted(str(p.relative_to(cwd)) for p in cwd.glob("*.py"))
+    py_files += sorted(str(p.relative_to(cwd)) for p in (cwd / "tests").glob("*.py"))
+
     cmd = [
-        "claude",
-        "-p", prompt,
-        "--output-format", "json",
-        "--permission-mode", "acceptEdits",
-        "--permission-prompts", "none",
-        "--allowedTools", *ALLOWED_TOOLS,
-        "--max-budget-usd", str(MAX_BUDGET_USD),
-        "--no-session-persistence",
+        "aider",
+        "--yes-always",
+        "--no-auto-commits",
+        "--model", model,
+        "--test-cmd", "pytest tests/ -v",
+        "--auto-test",
+        "--message", prompt,
+        *py_files,
     ]
     try:
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True,
             timeout=WALL_CLOCK_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        print(f"::warning::claude 執行超過 {WALL_CLOCK_TIMEOUT_SECONDS} 秒，中止", file=sys.stderr)
-        return False, ""
+    except subprocess.TimeoutExpired as e:
+        print(f"::warning::aider 執行超過 {WALL_CLOCK_TIMEOUT_SECONDS} 秒，中止", file=sys.stderr)
+        partial = (e.stdout or b"").decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return partial[-4000:]
 
     if result.returncode != 0:
-        print("::warning::claude 非正常結束", file=sys.stderr)
+        print("::warning::aider 非正常結束", file=sys.stderr)
         print(result.stderr[-4000:], file=sys.stderr)
-        return False, result.stdout
 
-    return True, result.stdout
-
-
-def summarize_claude_output(raw_stdout: str) -> str:
-    """--output-format json 回傳的是單一 JSON 物件，抓出最後的文字結果當摘要。"""
-    try:
-        data = json.loads(raw_stdout)
-        return data.get("result") or raw_stdout[-2000:]
-    except (json.JSONDecodeError, AttributeError):
-        return raw_stdout[-2000:]
+    return (result.stdout + result.stderr)[-4000:]
 
 
 def get_changed_files(cwd: Path) -> list[str]:
@@ -141,8 +146,7 @@ def main() -> int:
     issue_body = Path(args.issue_body_file).read_text(encoding="utf-8")
 
     prompt = build_prompt(args.issue_number, args.issue_title, issue_body)
-    ok, raw_output = run_claude(prompt, repo_dir)
-    summary = summarize_claude_output(raw_output) if raw_output else "(claude 沒有正常回傳輸出)"
+    summary = run_aider(prompt, repo_dir) or "(aider 沒有回傳輸出)"
 
     changed_files = get_changed_files(repo_dir)
 
