@@ -62,18 +62,20 @@ jobs:
         if: steps.pick.outputs.has_issue == 'true'
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+          ISSUE_NUMBER: ${{ steps.pick.outputs.number }}
         run: |
-          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+          gh issue edit "$ISSUE_NUMBER" --repo "$TARGET_REPO" \
             --add-label "$LABEL_IN_PROGRESS" --remove-label "$LABEL_TODO"
 
       - name: Checkout target repo
         if: steps.pick.outputs.has_issue == 'true'
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+          ISSUE_NUMBER: ${{ steps.pick.outputs.number }}
         run: |
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${TARGET_REPO}.git" target
           cd target
-          git checkout -b "swe-agent/issue-${{ steps.pick.outputs.number }}"
+          git checkout -b "swe-agent/issue-${ISSUE_NUMBER}"
           git config user.name "swe-agent-bot"
           git config user.email "actions@users.noreply.github.com"
 
@@ -86,11 +88,22 @@ jobs:
         if: steps.pick.outputs.has_issue == 'true'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # 用環境變數傳遞，不要直接把 ${{ }} 代入下面的 shell 指令字串——
+          # 2026-09 實測過：issue 標題只要包含雙引號（例如標題裡引用了一段
+          # 原文 "onsite in the US"），直接字串代入會把 shell 的引號結構
+          # 打斷，run_agent.py 收到破碎的參數直接被 argparse 拒絕。更嚴重的
+          # 是這種寫法本身是已知的 GitHub Actions script injection 手法——
+          # issue 標題是外部可控的輸入，直接代入 run: 腳本等於讓任何能開
+          # issue 的人有機會在 runner 裡塞任意 shell 指令、拿到裡面的
+          # secrets。改成 env 變數，走 bash 正常的變數展開，不會被當成
+          # shell 語法重新解析。
+          ISSUE_NUMBER: ${{ steps.pick.outputs.number }}
+          ISSUE_TITLE: ${{ steps.pick.outputs.title }}
         run: |
           set +e
           python3 scripts/run_agent.py \
-            --issue-number "${{ steps.pick.outputs.number }}" \
-            --issue-title "${{ steps.pick.outputs.title }}" \
+            --issue-number "$ISSUE_NUMBER" \
+            --issue-title "$ISSUE_TITLE" \
             --issue-body-file issue_body.md \
             --repo-dir target
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
@@ -100,19 +113,21 @@ jobs:
         if: steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code == '0'
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+          ISSUE_NUMBER: ${{ steps.pick.outputs.number }}
+          ISSUE_TITLE: ${{ steps.pick.outputs.title }}
         run: |
           cd target
           git add -A
-          git commit -m "fix: resolve #${{ steps.pick.outputs.number }} (${{ steps.pick.outputs.title }})
+          git commit -m "fix: resolve #${ISSUE_NUMBER} (${ISSUE_TITLE})
 
           Co-Authored-By: swe-agent-bot <actions@users.noreply.github.com>"
-          git push origin "swe-agent/issue-${{ steps.pick.outputs.number }}"
+          git push origin "swe-agent/issue-${ISSUE_NUMBER}"
           gh pr create --repo "$TARGET_REPO" \
-            --title "fix: ${{ steps.pick.outputs.title }} (closes #${{ steps.pick.outputs.number }})" \
+            --title "fix: ${ISSUE_TITLE} (closes #${ISSUE_NUMBER})" \
             --body-file ../agent_summary.md \
-            --head "swe-agent/issue-${{ steps.pick.outputs.number }}" \
+            --head "swe-agent/issue-${ISSUE_NUMBER}" \
             --base main
-          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+          gh issue edit "$ISSUE_NUMBER" --repo "$TARGET_REPO" \
             --remove-label "$LABEL_IN_PROGRESS"
 
       - name: Mark needs-human (no changes / failed / unexpected error)
@@ -125,15 +140,17 @@ jobs:
         if: always() && steps.pick.outputs.has_issue == 'true' && steps.agent.outputs.exit_code != '0'
         env:
           GH_TOKEN: ${{ secrets.TARGET_REPO_PAT }}
+          ISSUE_NUMBER: ${{ steps.pick.outputs.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if [ -f agent_summary.md ]; then
-            gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+            gh issue comment "$ISSUE_NUMBER" --repo "$TARGET_REPO" \
               --body-file agent_summary.md
           else
             # agent_summary.md 不存在代表根本沒跑到「Run SWE Agent」那步，
             # 是更早的步驟本身出錯（例如裝依賴失敗），附上這次 run 的 log 連結。
-            gh issue comment "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
-              --body "SWE Agent 這次執行中途發生非預期錯誤（pipeline 本身某個步驟失敗，不是 agent 修改/測試的問題），詳見 log：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh issue comment "$ISSUE_NUMBER" --repo "$TARGET_REPO" \
+              --body "SWE Agent 這次執行中途發生非預期錯誤（pipeline 本身某個步驟失敗，不是 agent 修改/測試的問題），詳見 log：${RUN_URL}"
           fi
-          gh issue edit "${{ steps.pick.outputs.number }}" --repo "$TARGET_REPO" \
+          gh issue edit "$ISSUE_NUMBER" --repo "$TARGET_REPO" \
             --remove-label "$LABEL_IN_PROGRESS" --add-label "$LABEL_NEEDS_HUMAN"
