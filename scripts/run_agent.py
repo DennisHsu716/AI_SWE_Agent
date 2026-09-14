@@ -51,6 +51,13 @@ SENSITIVE_FILES = {
     "config.py",  # 密鑰讀取邏輯在這裡，改動要額外小心
 }
 
+# Aider 自己的內部行為（例如第一次在這個 repo 跑，發現 .aider 快取/紀錄
+# 檔案沒被忽略，就自動在 .gitignore 加一行）不算「真的改到東西」。2026-09
+# 實測過一次：Aider 整段被 Groq rate limit 擋光、完全沒拿到任何一次成功回
+# 應，git diff 卻因為這個自動行為顯示「有改動」，導致 PASS 判準（有 diff +
+# 測試過）誤判成功，開了一個內容完全空洞的 PR。過濾掉這些檔案後才算數。
+NOOP_FILES = {".gitignore"}
+
 
 def build_prompt(issue_number: int, issue_title: str, issue_body: str) -> str:
     return f"""你在修一個叫 job-scraper 的 Python 專案裡的 bug/需求，來源是 GitHub issue #{issue_number}。
@@ -73,15 +80,26 @@ def build_prompt(issue_number: int, issue_title: str, issue_body: str) -> str:
 完成後用一段簡短的中文摘要說明你做了什麼改動、為什麼，還有測試結果。"""
 
 
+# 原本把 repo 裡所有 .py 檔案都列給 Aider（想說「檔案不多，全列出來成本很
+# 低」），2026-09 實測直接把這個假設打臉：scorer.py（900 多行、中文註解
+# 密集，token 比看起來的行數貴很多）加上 config.py（1000 多行，大部分是
+# 公司名單，跟邏輯 bug 基本無關）湊出單次請求 5~6 萬 token，而 Groq 免費
+# 層級目前所有一般 completion 模型統一都是 8000 TPM，直接整段被 rate limit
+# 擋光，Aider 一次成功的回應都沒拿到。
+#
+# 改成只給 scorer.py + tests/，這是目前這個 pipeline 主要處理的迴歸/評分
+# 邏輯 bug 集中的地方。代價：如果 issue 其實牽涉 scraper.py/scrapers.py
+# （抓取邏輯）或 config.py 裡的名單/關鍵字本身，這個範圍會漏掉，agent 大概
+# 率會卡住轉 needs-human——這是目前 8K TPM 限制下的已知取捨，不是遺漏。
+DEFAULT_AIDER_FILES = ["scorer.py"]
+
+
 def run_aider(prompt: str, cwd: Path) -> str:
     """呼叫 Aider 修改 cwd 底下的檔案，回傳它的文字輸出（不代表成功與否，
     成功與否交給呼叫端用 git diff + pytest 獨立驗證）。"""
     model = os.environ.get("AIDER_MODEL", DEFAULT_AIDER_MODEL)
 
-    # 一次性 --message 模式下，Aider 能不能自己發現該改哪個檔案沒有明確
-    # 文件保證，保險起見明確把 repo 裡的 .py 檔案都列給它，不要賭它會自動
-    # 找到——job-scraper 檔案不多，全列出來成本很低。
-    py_files = sorted(str(p.relative_to(cwd)) for p in cwd.glob("*.py"))
+    py_files = [f for f in DEFAULT_AIDER_FILES if (cwd / f).exists()]
     py_files += sorted(str(p.relative_to(cwd)) for p in (cwd / "tests").glob("*.py"))
 
     cmd = [
@@ -89,6 +107,9 @@ def run_aider(prompt: str, cwd: Path) -> str:
         "--yes-always",
         "--no-auto-commits",
         "--model", model,
+        # repo-map 會額外掃描整個 repo、摘要進 prompt 裡，我們已經明確指定
+        # 要改哪個檔案了，不需要這個，關掉省 token。
+        "--map-tokens", "0",
         "--test-cmd", "pytest tests/ -v",
         "--auto-test",
         "--message", prompt,
@@ -152,8 +173,9 @@ def main() -> int:
     summary = run_aider(prompt, repo_dir) or "(aider 沒有回傳輸出)"
 
     changed_files = get_changed_files(repo_dir)
+    meaningful_files = [f for f in changed_files if f not in NOOP_FILES]
 
-    if not changed_files:
+    if not meaningful_files:
         Path("agent_summary.md").write_text(
             f"Agent 判斷沒有需要修改的地方，或執行未完成。\n\n{summary}",
             encoding="utf-8",
