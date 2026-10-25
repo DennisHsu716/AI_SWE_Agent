@@ -17,7 +17,16 @@ env:
   LABEL_NEEDS_HUMAN: swe-agent-needs-human
   # 想換模型（例如這個模型撞到能力不夠、或 Groq 把它下架了）
   # 改這裡就好，不用動 scripts/run_agent.py。
-  AIDER_MODEL: groq/openai/gpt-oss-120b
+  #
+  # 2026-10-25：實測 3/3 全部卡在 Groq 免費層級的 8000 TPM 單次請求上限——
+  # scorer.py（929 行，中文註解密集，token 比行數貴很多）加上 tests/ 單次
+  # 請求要 16,000+ tokens，不管 issue 本身多簡單都會直接被擋，跟 bug 難度
+  # 無關，是純粹的額度問題。暫時換成 Gemini（Google AI Studio 免費層級的
+  # context window 大很多，單次請求塞得下整個 scorer.py 不會卡），需要另外
+  # 設定 GEMINI_API_KEY secret（可以沿用 job-scraper 自己 .env 裡已經有的
+  # key）。之後如果 Groq 那邊把免費層級額度調大，或想換別家，改這行 + 下面
+  # 「Run SWE Agent」那步的 API key 環境變數就好，其他都不用動。
+  AIDER_MODEL: gemini/gemini-2.5-flash
 
 jobs:
   agent:
@@ -88,6 +97,7 @@ jobs:
         if: steps.pick.outputs.has_issue == 'true'
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # 用環境變數傳遞，不要直接把 ${{ }} 代入下面的 shell 指令字串——
           # 2026-09 實測過：issue 標題只要包含雙引號（例如標題裡引用了一段
           # 原文 "onsite in the US"），直接字串代入會把 shell 的引號結構
